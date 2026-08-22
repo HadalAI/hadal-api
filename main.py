@@ -2,7 +2,7 @@
 import os
 import time
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -182,7 +182,9 @@ def get_run(slug: str):
 
 
 @app.post("/workers/register")
-def register_worker(w: WorkerIn, x_worker_key: str = Header(default="")):
+def register_worker(w: WorkerIn, request: Request, x_worker_key: str = Header(default="")):
+    if not _rate_ok(f"reg:{client_ip(request)}", limit=10):
+        raise HTTPException(status_code=429, detail="slow down")
     # Require a valid account key: no anonymous worker spam inflating network stats.
     if x_worker_key:
         owners = q(
@@ -203,7 +205,9 @@ def register_worker(w: WorkerIn, x_worker_key: str = Header(default="")):
 
 
 @app.post("/workers/heartbeat")
-def heartbeat(hb: Heartbeat):
+def heartbeat(hb: Heartbeat, request: Request):
+    if not _rate_ok(f"hb:{client_ip(request)}", limit=30):
+        raise HTTPException(status_code=429, detail="slow down")
     rows = q("SELECT last_seen FROM workers WHERE id=?", (hb.id,))
     if not rows:
         raise HTTPException(status_code=404, detail="unknown worker - register first")
@@ -410,6 +414,38 @@ def logout(response: Response, hadal_session: str = Cookie(default="")):
     return {"status": "ok"}
 
 
+
+
+# ---------- RATE LIMITING ----------
+# ponytail: in-memory per-instance limiter; Vercel serverless instances are short-lived so
+# this is a soft brake, not a hard wall. Add Vercel WAF/upstash if abuse becomes real.
+import collections
+
+_RATE: dict = {}  # key -> deque[timestamps]
+_RATE_LIMIT = 60       # requests
+_RATE_WINDOW = 60.0    # seconds
+
+
+def _rate_ok(bucket_key: str, limit: int = _RATE_LIMIT) -> bool:
+    now = time.time()
+    dq = _RATE.setdefault(bucket_key, collections.deque())
+    while dq and now - dq[0] > _RATE_WINDOW:
+        dq.popleft()
+    if len(dq) >= limit:
+        return False
+    dq.append(now)
+    # keep the dict from growing forever
+    if len(_RATE) > 10000:
+        for k in [k for k, v in _RATE.items() if not v]:
+            _RATE.pop(k, None)
+    return True
+
+
+def client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for", "")
+    return (fwd.split(",")[0].strip() or "unknown") if fwd else "unknown"
+
+
 # ---------- WORKER MANAGEMENT (dashboard + TUI) ----------
 import uuid
 
@@ -418,7 +454,11 @@ def _require_user(hadal_session: str = "", authorization: str = "") -> dict:
     token = hadal_session or authorization.replace("Bearer ", "")
     if not token:
         raise HTTPException(status_code=401, detail="sign in first")
-    rows = q("SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=?", (token,))
+    rows = q(
+        """SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id
+           WHERE s.token=? AND s.created_at > ?""",
+        (token, time.time() - 60 * 60 * 24 * 30),
+    )
     if not rows:
         raise HTTPException(status_code=401, detail="invalid session")
     return rows[0]
@@ -733,6 +773,14 @@ def jobs_complete(job_id: str, body: JobResultIn, x_worker_key: str = Header(def
     if job["status"] == "DONE":
         return {"status": "already-done", "gpu_hours_credited": 0}
 
+    # Liveness proof: the completing worker must have heartbeated recently (it does, every 30s).
+    # A stolen key submitting results without running our worker fails this check.
+    if job["worker_id"]:
+        w = q("SELECT last_seen FROM workers WHERE id=?", (job["worker_id"],))
+        if not w or (time.time() - (w[0]["last_seen"] or 0)) > 300:
+            q("UPDATE jobs SET status='PENDING', worker_id=NULL WHERE id=?", (job_id,))
+            raise HTTPException(status_code=400, detail="worker offline - result rejected")
+
     # credit GPU hours for the job: 0.5h flat per shard (ponytail: flat rate until real util telemetry)
     hours = 0.5
     q("UPDATE jobs SET status='DONE', result=?, finished_at=? WHERE id=?", (body.result[:10000], time.time(), job_id))
@@ -764,3 +812,21 @@ def job_progress(run_slug: str):
     done = by.get("DONE", 0)
     return {"total": total, "done": done, "pending": by.get("PENDING", 0),
             "assigned": by.get("ASSIGNED", 0), "pct": round(done * 100 / total) if total else 0}
+
+@app.get("/admin/jobs/audit/{run_slug}")
+def audit_jobs(run_slug: str, hadal_session: str = Cookie(default=""), authorization: str = Header(default="")):
+    """Fraud spot-check: identical result blobs from different workers = copy-paste cheating."""
+    _require_admin(hadal_session, authorization)
+    jobs = q(
+        "SELECT id, worker_id, result FROM jobs WHERE run_slug=? AND status='DONE'",
+        (run_slug,),
+    )
+    seen: dict = {}
+    flagged = []
+    for j in jobs:
+        sig = (j["result"] or "").strip()[:200]
+        if sig and sig in seen and seen[sig] != j["worker_id"]:
+            flagged.append(j["id"])
+        else:
+            seen[sig] = j["worker_id"]
+    return {"run": run_slug, "done": len(jobs), "flagged_duplicate_results": flagged}
