@@ -18,7 +18,7 @@ SITE_URL = os.environ.get("HADAL_SITE_URL", "https://hadal.run")
 
 app = FastAPI(title="Hadal Research API")
 if CORS_ORIGINS:
-    app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_methods=["*"], allow_headers=["*"])
+    app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_methods=["*"], allow_headers=["*"], allow_credentials=True)
 
 TABLES = {
     "runs": """CREATE TABLE IF NOT EXISTS runs(
@@ -34,7 +34,10 @@ TABLES = {
   vram REAL NOT NULL DEFAULT 0,
   registered_at REAL NOT NULL,
   last_seen REAL,
-  gpu_hours REAL NOT NULL DEFAULT 0
+  gpu_hours REAL NOT NULL DEFAULT 0,
+  owner_id TEXT,
+  name TEXT NOT NULL DEFAULT '',
+  paused INTEGER NOT NULL DEFAULT 0
 )""",
     "models": """CREATE TABLE IF NOT EXISTS models(
   id TEXT PRIMARY KEY,
@@ -49,7 +52,8 @@ TABLES = {
   avatar_url TEXT NOT NULL DEFAULT '',
   github_id TEXT,
   discord_id TEXT,
-  created_at REAL NOT NULL
+  created_at REAL NOT NULL,
+  api_key TEXT
 )""",
     "sessions": """CREATE TABLE IF NOT EXISTS sessions(
   token TEXT PRIMARY KEY,
@@ -171,14 +175,14 @@ def get_run(slug: str):
 
 @app.post("/workers/register")
 def register_worker(w: WorkerIn):
+    # column order differs between pg (with owner/name/paused) and sqlite; branch SQL
     if DATABASE_URL:
-        sql = """INSERT INTO workers VALUES (?,?,?,?,NULL,0)
+        sql = """INSERT INTO workers (id,gpu,vram,registered_at,last_seen,gpu_hours,name,paused)
+                 VALUES (?,?,?,?,NULL,0,'',0)
                  ON CONFLICT (id) DO UPDATE SET gpu=EXCLUDED.gpu, vram=EXCLUDED.vram"""
-        params = (w.id, w.gpu, w.vram, time.time())
     else:
         sql = "INSERT OR REPLACE INTO workers VALUES (?,?,?,?,NULL,0)"
-        params = (w.id, w.gpu, w.vram, time.time())
-    q(sql, params)
+    q(sql, (w.id, w.gpu, w.vram, time.time()))
     return {"status": "registered", "id": w.id}
 
 
@@ -357,3 +361,93 @@ def logout(response: Response, hadal_session: str = Cookie(default="")):
         q("DELETE FROM sessions WHERE token=?", (hadal_session,))
     response.delete_cookie("hadal_session")
     return {"status": "ok"}
+
+
+# ---------- WORKER MANAGEMENT (dashboard + TUI) ----------
+import uuid
+
+
+def _require_user(hadal_session: str) -> dict:
+    if not hadal_session:
+        raise HTTPException(status_code=401, detail="sign in first")
+    rows = q("SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=?", (hadal_session,))
+    if not rows:
+        raise HTTPException(status_code=401, detail="invalid session")
+    return rows[0]
+
+
+@app.post("/account/key")
+def ensure_api_key(response: Response, hadal_session: str = Cookie(default="")):
+    """Get-or-create the account's worker API key."""
+    user = _require_user(hadal_session)
+    if not user["api_key"]:
+        key = "hk_" + secrets.token_hex(20)
+        q("UPDATE users SET api_key=? WHERE id=?", (key, user["id"]))
+        user["api_key"] = key
+    response.status_code = 200
+    return {"api_key": user["api_key"]}
+
+
+@app.get("/account/workers")
+def my_workers(x_worker_key: str = Header(default=""), hadal_session: str = Cookie(default="")):
+    """List workers owned by this account. Accepts session cookie OR worker key."""
+    if x_worker_key:
+        rows = q(
+            "SELECT w.id, w.gpu, w.vram, w.name, w.paused, w.last_seen, w.gpu_hours FROM workers w JOIN users u ON u.id=w.owner_id WHERE u.api_key=?",
+            (x_worker_key,),
+        )
+        return rows
+    user = _require_user(hadal_session)
+    return q(
+        "SELECT id, gpu, vram, name, paused, last_seen, gpu_hours FROM workers WHERE owner_id=?",
+        (user["id"],),
+    )
+
+
+class ClaimIn(BaseModel):
+    name: str = ""
+    machine: str = ""
+
+
+@app.post("/workers/claim")
+def claim_worker(body: ClaimIn, x_worker_key: str = Header(default="")):
+    """Called by the TUI on first run: binds this machine to an account via its key.
+
+    Machine identity: hostname+mac hash so re-runs find the same worker row.
+    """
+    if not x_worker_key:
+        raise HTTPException(status_code=401, detail="worker key required")
+    owners = q("SELECT id FROM users WHERE api_key=?", (x_worker_key,))
+    if not owners:
+        raise HTTPException(status_code=401, detail="invalid worker key")
+    owner_id = owners[0]["id"]
+    machine = body.machine or secrets.token_hex(4)
+    wid = f"{machine[:12]}"
+    existing = q("SELECT * FROM workers WHERE id=?", (wid,))
+    if existing:
+        q("UPDATE workers SET name=?, owner_id=? WHERE id=?", (body.name or existing[0]["name"], owner_id, wid))
+    else:
+        q(
+            "INSERT INTO workers VALUES (?,?,?,?,NULL,0,?,?,0)",
+            (wid, "detecting", 0, time.time(), owner_id, body.name or ""),
+        )
+    return {"worker_id": wid, "owner": True}
+
+
+class SettingsIn(BaseModel):
+    name: str | None = None
+    paused: bool | None = None
+
+
+@app.patch("/workers/{worker_id}")
+def update_worker(worker_id: str, body: SettingsIn, x_worker_key: str = Header(default="")):
+    if not x_worker_key:
+        raise HTTPException(status_code=401, detail="worker key required")
+    rows = q("SELECT w.* FROM workers w JOIN users u ON u.id=w.owner_id WHERE w.id=? AND u.api_key=?", (worker_id, x_worker_key))
+    if not rows:
+        raise HTTPException(status_code=404, detail="worker not found for this key")
+    if body.name is not None:
+        q("UPDATE workers SET name=? WHERE id=?", (body.name, worker_id))
+    if body.paused is not None:
+        q("UPDATE workers SET paused=? WHERE id=?", (1 if body.paused else 0, worker_id))
+    return q("SELECT id, gpu, vram, name, paused, last_seen, gpu_hours FROM workers WHERE id=?", (worker_id,))[0]
