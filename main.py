@@ -366,8 +366,9 @@ def me(hadal_session: str = Cookie(default=""), authorization: str = Header(defa
     hadal_session = token
     rows = q(
         """SELECT u.id, u.username, u.avatar_url, u.github_id, u.discord_id
-           FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token=?""",
-        (hadal_session,),
+           FROM sessions s JOIN users u ON u.id = s.user_id
+           WHERE s.token=? AND s.created_at > ?""",
+        (hadal_session, time.time() - 60 * 60 * 24 * 30),
     )
     if not rows:
         raise HTTPException(status_code=401, detail="invalid session")
@@ -569,8 +570,8 @@ def _require_admin(hadal_session: str = Cookie(default=""), authorization: str =
         raise HTTPException(status_code=401, detail="sign in first")
     rows = q(
         """SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id
-           WHERE s.token=? AND u.is_admin=1""",
-        (token,),
+           WHERE s.token=? AND u.is_admin=1 AND s.created_at > ?""",
+        (token, time.time() - 60 * 60 * 24 * 30),
     )
     if not rows:
         raise HTTPException(status_code=403, detail="admin only")
