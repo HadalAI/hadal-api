@@ -37,7 +37,9 @@ TABLES = {
   gpu_hours REAL NOT NULL DEFAULT 0,
   owner_id TEXT,
   name TEXT NOT NULL DEFAULT '',
-  paused INTEGER NOT NULL DEFAULT 0
+  paused INTEGER NOT NULL DEFAULT 0,
+  cpu_limit INTEGER NOT NULL DEFAULT 40,
+  vram_limit REAL NOT NULL DEFAULT 40
 )""",
     "models": """CREATE TABLE IF NOT EXISTS models(
   id TEXT PRIMARY KEY,
@@ -434,14 +436,14 @@ def my_workers(x_worker_key: str = Header(default=""), hadal_session: str = Cook
     """List workers owned by this account. Accepts session cookie OR worker key."""
     if x_worker_key:
         rows = q(
-            """SELECT w.id, w.gpu, w.vram, w.name, w.paused, w.last_seen, w.gpu_hours
+            """SELECT w.id, w.gpu, w.vram, w.name, w.paused, w.last_seen, w.gpu_hours, w.cpu_limit, w.vram_limit
                FROM workers w JOIN worker_keys k ON k.user_id = w.owner_id WHERE k.key=?""",
             (x_worker_key,),
         )
         return rows
     user = _require_user(hadal_session)
     return q(
-        "SELECT id, gpu, vram, name, paused, last_seen, gpu_hours FROM workers WHERE owner_id=?",
+        "SELECT id, gpu, vram, name, paused, last_seen, gpu_hours, cpu_limit, vram_limit FROM workers WHERE owner_id=?",
         (user["id"],),
     )
 
@@ -479,6 +481,8 @@ def claim_worker(body: ClaimIn, x_worker_key: str = Header(default="")):
 class SettingsIn(BaseModel):
     name: str | None = None
     paused: bool | None = None
+    cpu_limit: int | None = None
+    vram_limit: float | None = None
 
 
 @app.patch("/workers/{worker_id}")
@@ -492,4 +496,8 @@ def update_worker(worker_id: str, body: SettingsIn, x_worker_key: str = Header(d
         q("UPDATE workers SET name=? WHERE id=?", (body.name, worker_id))
     if body.paused is not None:
         q("UPDATE workers SET paused=? WHERE id=?", (1 if body.paused else 0, worker_id))
-    return q("SELECT id, gpu, vram, name, paused, last_seen, gpu_hours FROM workers WHERE id=?", (worker_id,))[0]
+    if body.cpu_limit is not None:
+        q("UPDATE workers SET cpu_limit=? WHERE id=?", (max(5, min(100, body.cpu_limit)), worker_id))
+    if body.vram_limit is not None:
+        q("UPDATE workers SET vram_limit=? WHERE id=?", (max(1.0, min(100.0, body.vram_limit)), worker_id))
+    return q("SELECT id, gpu, vram, name, paused, last_seen, gpu_hours, cpu_limit, vram_limit FROM workers WHERE id=?", (worker_id,))[0]
