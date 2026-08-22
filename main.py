@@ -255,7 +255,7 @@ def _new_session(response: Response, user_id: str):
     q("INSERT INTO sessions VALUES (?,?,?)", (token, user_id, time.time()))
     response.set_cookie(
         "hadal_session", token,
-        max_age=60 * 60 * 24 * 30, secure=True, httponly=True, samesite="lax",
+        max_age=60 * 60 * 24 * 30, secure=True, httponly=True, samesite="none",
     )
 
 
@@ -283,7 +283,7 @@ def auth_start(provider: str):
         url = "https://discord.com/oauth2/authorize?" + urllib.parse.urlencode(params)
     resp = Response(status_code=302)
     resp.headers["Location"] = url
-    resp.set_cookie("oauth_state", state, max_age=600, secure=True, httponly=True, samesite="lax")
+    resp.set_cookie("oauth_state", state, max_age=600, secure=True, httponly=True, samesite="none")
     return resp
 
 
