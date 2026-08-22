@@ -410,10 +410,11 @@ def logout(response: Response, hadal_session: str = Cookie(default="")):
 import uuid
 
 
-def _require_user(hadal_session: str) -> dict:
-    if not hadal_session:
+def _require_user(hadal_session: str = "", authorization: str = "") -> dict:
+    token = hadal_session or authorization.replace("Bearer ", "")
+    if not token:
         raise HTTPException(status_code=401, detail="sign in first")
-    rows = q("SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=?", (hadal_session,))
+    rows = q("SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=?", (token,))
     if not rows:
         raise HTTPException(status_code=401, detail="invalid session")
     return rows[0]
@@ -534,7 +535,7 @@ def _require_admin(hadal_session: str = Cookie(default=""), authorization: str =
 
 @app.get("/admin/me")
 def admin_me(hadal_session: str = Cookie(default=""), authorization: str = Header(default="")):
-    user = _require_user(hadal_session, authorization)
+    user = _require_user(hadal_session or authorization.replace("Bearer ", ""))
     return {"username": user["username"], "is_admin": bool(user["is_admin"])}
 
 
