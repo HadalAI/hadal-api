@@ -10,6 +10,11 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 SQLITE_PATH = os.environ.get("HADAL_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "hadal.db"))
 ADMIN_TOKEN = os.environ.get("HADAL_ADMIN_TOKEN", "")
 CORS_ORIGINS = [o for o in os.environ.get("HADAL_CORS_ORIGINS", "").split(",") if o]
+GITHUB_CLIENT_ID = os.environ.get("GITHUB_CLIENT_ID", "")
+GITHUB_CLIENT_SECRET = os.environ.get("GITHUB_CLIENT_SECRET", "")
+DISCORD_CLIENT_ID = os.environ.get("DISCORD_CLIENT_ID", "")
+DISCORD_CLIENT_SECRET = os.environ.get("DISCORD_CLIENT_SECRET", "")
+SITE_URL = os.environ.get("HADAL_SITE_URL", "https://hadal.run")
 
 app = FastAPI(title="Hadal Research API")
 if CORS_ORIGINS:
@@ -36,6 +41,19 @@ TABLES = {
   name TEXT NOT NULL,
   description TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL DEFAULT 'PLANNED',
+  created_at REAL NOT NULL
+)""",
+    "users": """CREATE TABLE IF NOT EXISTS users(
+  id TEXT PRIMARY KEY,
+  username TEXT NOT NULL,
+  avatar_url TEXT NOT NULL DEFAULT '',
+  github_id TEXT,
+  discord_id TEXT,
+  created_at REAL NOT NULL
+)""",
+    "sessions": """CREATE TABLE IF NOT EXISTS sessions(
+  token TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id),
   created_at REAL NOT NULL
 )""",
 }
@@ -198,3 +216,144 @@ def stats():
         "gpu_hours": round(q("SELECT COALESCE(SUM(gpu_hours), 0) s FROM workers")[0]["s"], 2),
         "active_runs": q("SELECT COUNT(*) c FROM runs WHERE status = 'ACTIVE'")[0]["c"],
     }
+
+
+# ---------- AUTH (GitHub + Discord OAuth) ----------
+import secrets
+import urllib.parse
+
+from fastapi import Cookie, Response
+
+
+def _upsert_user(provider: str, provider_id: str, username: str, avatar: str) -> dict:
+    """Find-or-create a user keyed by provider id; link second provider if new."""
+    rows = q(f"SELECT * FROM users WHERE {provider}_id=?", (provider_id,))
+    if rows:
+        user = rows[0]
+        q("UPDATE users SET username=?, avatar_url=? WHERE id=?", (username, avatar, user["id"]))
+        return q(f"SELECT * FROM users WHERE {provider}_id=?", (provider_id,))[0]
+    uid = secrets.token_hex(8)
+    q(
+        f"INSERT INTO users VALUES (?,?,?,?,NULL,?)",
+        (uid, username, avatar, provider_id, time.time()),
+    )
+    return q("SELECT * FROM users WHERE id=?", (uid,))[0]
+
+
+def _new_session(response: Response, user_id: str):
+    token = secrets.token_hex(32)
+    q("INSERT INTO sessions VALUES (?,?,?)", (token, user_id, time.time()))
+    response.set_cookie(
+        "hadal_session", token,
+        max_age=60 * 60 * 24 * 30, secure=True, httponly=True, samesite="lax",
+    )
+
+
+@app.get("/auth/{provider}/start")
+def auth_start(provider: str):
+    if provider not in ("github", "discord"):
+        raise HTTPException(status_code=404)
+    state = secrets.token_hex(16)
+    if provider == "github":
+        params = {
+            "client_id": GITHUB_CLIENT_ID,
+            "redirect_uri": "https://api.hadal.run/auth/github/callback",
+            "scope": "read:user",
+            "state": state,
+        }
+        url = "https://github.com/login/oauth/authorize?" + urllib.parse.urlencode(params)
+    else:
+        params = {
+            "client_id": DISCORD_CLIENT_ID,
+            "redirect_uri": "https://api.hadal.run/auth/discord/callback",
+            "response_type": "code",
+            "scope": "identify",
+            "state": state,
+        }
+        url = "https://discord.com/oauth2/authorize?" + urllib.parse.urlencode(params)
+    resp = Response(status_code=302)
+    resp.headers["Location"] = url
+    resp.set_cookie("oauth_state", state, max_age=600, secure=True, httponly=True, samesite="lax")
+    return resp
+
+
+async def _finish_oauth(provider: str, code: str, response: Response) -> str:
+    import httpx
+
+    if provider == "github":
+        tok_r = await httpx.post(
+            "https://github.com/login/oauth/access_token",
+            json={
+                "client_id": GITHUB_CLIENT_ID,
+                "client_secret": GITHUB_CLIENT_SECRET,
+                "code": code,
+            },
+            headers={"Accept": "application/json"},
+        )
+        access = tok_r.json().get("access_token")
+        if not access:
+            raise HTTPException(status_code=400, detail="token exchange failed")
+        hdrs = {"Authorization": f"Bearer {access}"}
+        u_r = await httpx.get("https://api.github.com/user", headers=hdrs)
+        u = u_r.json()
+        user = _upsert_user("github", str(u["id"]), u.get("login") or "", u.get("avatar_url") or "")
+    else:
+        data = {
+            "client_id": DISCORD_CLIENT_ID,
+            "client_secret": DISCORD_CLIENT_SECRET,
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": "https://api.hadal.run/auth/discord/callback",
+        }
+        tok_r = await httpx.post("https://discord.com/api/oauth2/token", data=data)
+        access = tok_r.json().get("access_token")
+        if not access:
+            raise HTTPException(status_code=400, detail="token exchange failed")
+        u_r = await httpx.get(
+            "https://discord.com/api/users/@me",
+            headers={"Authorization": f"Bearer {access}"},
+        )
+        u = u_r.json()
+        avatar = (
+            f"https://cdn.discordapp.com/avatars/{u['id']}/{u['avatar']}.png"
+            if u.get("avatar")
+            else ""
+        )
+        user = _upsert_user("discord", u["id"], u.get("username") or "", avatar)
+
+    _new_session(response, user["id"])
+    return user["username"]
+
+
+@app.get("/auth/github/callback")
+async def github_callback(code: str, response: Response):
+    await _finish_oauth("github", code, response)
+    return Response(status_code=302, headers={"Location": SITE_URL})
+
+
+@app.get("/auth/discord/callback")
+async def discord_callback(code: str, response: Response):
+    await _finish_oauth("discord", code, response)
+    return Response(status_code=302, headers={"Location": SITE_URL})
+
+
+@app.get("/me")
+def me(hadal_session: str = Cookie(default="")):
+    if not hadal_session:
+        raise HTTPException(status_code=401, detail="not signed in")
+    rows = q(
+        """SELECT u.id, u.username, u.avatar_url, u.github_id, u.discord_id
+           FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token=?""",
+        (hadal_session,),
+    )
+    if not rows:
+        raise HTTPException(status_code=401, detail="invalid session")
+    return rows[0]
+
+
+@app.post("/logout")
+def logout(response: Response, hadal_session: str = Cookie(default="")):
+    if hadal_session:
+        q("DELETE FROM sessions WHERE token=?", (hadal_session,))
+    response.delete_cookie("hadal_session")
+    return {"status": "ok"}
