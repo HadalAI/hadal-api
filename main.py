@@ -250,13 +250,14 @@ def _upsert_user(provider: str, provider_id: str, username: str, avatar: str) ->
     return q("SELECT * FROM users WHERE id=?", (uid,))[0]
 
 
-def _new_session(response: Response, user_id: str):
+def _new_session(response: Response, user_id: str) -> str:
     token = secrets.token_hex(32)
     q("INSERT INTO sessions VALUES (?,?,?)", (token, user_id, time.time()))
     response.set_cookie(
         "hadal_session", token,
         max_age=60 * 60 * 24 * 30, secure=True, httponly=True, samesite="none",
     )
+    return token
 
 
 @app.get("/auth/{provider}/start")
@@ -287,7 +288,7 @@ def auth_start(provider: str):
     return resp
 
 
-def _finish_oauth(provider: str, code: str, response: Response) -> str:
+def _finish_oauth(provider: str, code: str, response: Response) -> tuple[str, str]:
     import httpx
 
     if provider == "github":
@@ -331,32 +332,28 @@ def _finish_oauth(provider: str, code: str, response: Response) -> str:
         )
         user = _upsert_user("discord", u["id"], u.get("username") or "", avatar)
 
-    _new_session(response, user["id"])
-    return user["username"]
+    token = _new_session(response, user["id"])
+    return user["username"], token
 
 
 @app.get("/auth/github/callback")
 def github_callback(code: str, response: Response):
-    username = _finish_oauth("github", code, response)
-    return Response(
-        status_code=302,
-        headers={"Location": f"{SITE_URL}/dashboard#auth=ok&u={urllib.parse.quote(username)}"},
-    )
+    username, token = _finish_oauth("github", code, response)
+    return Response(status_code=302, headers={"Location": f"{SITE_URL}/dashboard#token={token}"})
 
 
 @app.get("/auth/discord/callback")
 def discord_callback(code: str, response: Response):
-    username = _finish_oauth("discord", code, response)
-    return Response(
-        status_code=302,
-        headers={"Location": f"{SITE_URL}/dashboard#auth=ok&u={urllib.parse.quote(username)}"},
-    )
+    username, token = _finish_oauth("discord", code, response)
+    return Response(status_code=302, headers={"Location": f"{SITE_URL}/dashboard#token={token}"})
 
 
 @app.get("/me")
-def me(hadal_session: str = Cookie(default="")):
-    if not hadal_session:
+def me(hadal_session: str = Cookie(default=""), authorization: str = Header(default="")):
+    token = hadal_session or authorization.replace("Bearer ", "")
+    if not token:
         raise HTTPException(status_code=401, detail="not signed in")
+    hadal_session = token
     rows = q(
         """SELECT u.id, u.username, u.avatar_url, u.github_id, u.discord_id
            FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token=?""",
@@ -373,8 +370,8 @@ class KeyIn(BaseModel):
 
 
 @app.get("/account/keys")
-def list_keys(hadal_session: str = Cookie(default="")):
-    user = _require_user(hadal_session)
+def list_keys(hadal_session: str = Cookie(default=""), authorization: str = Header(default="")):
+    user = _require_user(hadal_session or authorization.replace("Bearer ", ""))
     keys = q("SELECT key, label, created_at FROM worker_keys WHERE user_id=? ORDER BY created_at", (user["id"],))
     # include legacy single key if set and not already in table
     if user["api_key"] and not any(k["key"] == user["api_key"] for k in keys):
@@ -383,16 +380,16 @@ def list_keys(hadal_session: str = Cookie(default="")):
 
 
 @app.post("/account/keys", status_code=201)
-def create_key(body: KeyIn, hadal_session: str = Cookie(default="")):
-    user = _require_user(hadal_session)
+def create_key(body: KeyIn, hadal_session: str = Cookie(default=""), authorization: str = Header(default="")):
+    user = _require_user(hadal_session or authorization.replace("Bearer ", ""))
     key = "hk_" + secrets.token_hex(20)
     q("INSERT INTO worker_keys VALUES (?,?,?,?)", (key, body.label, user["id"], time.time()))
     return {"key": key, "label": body.label}
 
 
 @app.delete("/account/keys/{key}")
-def delete_key(key: str, hadal_session: str = Cookie(default="")):
-    user = _require_user(hadal_session)
+def delete_key(key: str, hadal_session: str = Cookie(default=""), authorization: str = Header(default="")):
+    user = _require_user(hadal_session or authorization.replace("Bearer ", ""))
     q("DELETE FROM worker_keys WHERE key=? AND user_id=?", (key, user["id"]))
     if user["api_key"] == key:
         q("UPDATE users SET api_key=NULL WHERE id=?", (user["id"],))
@@ -421,9 +418,9 @@ def _require_user(hadal_session: str) -> dict:
 
 
 @app.post("/account/key")
-def ensure_api_key(response: Response, hadal_session: str = Cookie(default="")):
+def ensure_api_key(response: Response, hadal_session: str = Cookie(default=""), authorization: str = Header(default="")):
     """Get-or-create the account's worker API key."""
-    user = _require_user(hadal_session)
+    user = _require_user(hadal_session or authorization.replace("Bearer ", ""))
     if not user["api_key"]:
         key = "hk_" + secrets.token_hex(20)
         q("UPDATE users SET api_key=? WHERE id=?", (key, user["id"]))
