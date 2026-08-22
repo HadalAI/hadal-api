@@ -182,8 +182,16 @@ def get_run(slug: str):
 
 
 @app.post("/workers/register")
-def register_worker(w: WorkerIn):
-    # column order differs between pg (with owner/name/paused) and sqlite; branch SQL
+def register_worker(w: WorkerIn, x_worker_key: str = Header(default="")):
+    # Require a valid account key: no anonymous worker spam inflating network stats.
+    if x_worker_key:
+        owners = q(
+            "SELECT user_id FROM worker_keys WHERE key=? UNION SELECT id FROM users WHERE api_key=?",
+            (x_worker_key, x_worker_key),
+        )
+        if owners:
+            owner_id = owners[0].get("user_id") or owners[0].get("id")
+            q("UPDATE workers SET owner_id=? WHERE id=?", (owner_id, w.id))
     if DATABASE_URL:
         sql = """INSERT INTO workers (id,gpu,vram,registered_at,last_seen,gpu_hours,name,paused)
                  VALUES (?,?,?,?,NULL,0,'',0)
@@ -199,13 +207,9 @@ def heartbeat(hb: Heartbeat):
     rows = q("SELECT last_seen FROM workers WHERE id=?", (hb.id,))
     if not rows:
         raise HTTPException(status_code=404, detail="unknown worker - register first")
-    last = rows[0]["last_seen"]
-    # ponytail: credit elapsed-since-last-heartbeat capped at 10min; credit-on-verified-job comes with jobs pipeline
-    delta = min(max(time.time() - last, 0), 600) if last else 0
-    q(
-        "UPDATE workers SET last_seen=?, gpu_hours=gpu_hours+? WHERE id=?",
-        (time.time(), delta / 3600.0, hb.id),
-    )
+    # Hours are credited ONLY on verified job completion (/jobs/{id}/complete).
+    # Heartbeat is liveness only - idle scripts earn nothing.
+    q("UPDATE workers SET last_seen=? WHERE id=?", (time.time(), hb.id))
     return {"status": "alive"}
 
 
@@ -223,9 +227,9 @@ def list_models():
 def stats():
     online_cutoff = time.time() - 300
     return {
-        "contributors": q("SELECT COUNT(*) c FROM workers")[0]["c"],
-        "workers_online": q("SELECT COUNT(*) c FROM workers WHERE last_seen > ?", (online_cutoff,))[0]["c"],
-        "gpu_hours": round(q("SELECT COALESCE(SUM(gpu_hours), 0) s FROM workers")[0]["s"], 2),
+        "contributors": q("SELECT COUNT(*) c FROM workers WHERE owner_id IS NOT NULL")[0]["c"],
+        "workers_online": q("SELECT COUNT(*) c FROM workers WHERE last_seen > ? AND owner_id IS NOT NULL", (online_cutoff,))[0]["c"],
+        "gpu_hours": round(q("SELECT COALESCE(SUM(gpu_hours), 0) s FROM workers WHERE owner_id IS NOT NULL")[0]["s"], 2),
         "active_runs": q("SELECT COUNT(*) c FROM runs WHERE status = 'ACTIVE'")[0]["c"],
     }
 
