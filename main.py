@@ -421,11 +421,19 @@ def _require_user(hadal_session: str) -> dict:
 
 @app.post("/account/key")
 def ensure_api_key(response: Response, hadal_session: str = Cookie(default=""), authorization: str = Header(default="")):
-    """Get-or-create the account's worker API key."""
+    """Get-or-create the account's worker API key. Reuses an existing key if one exists."""
     user = _require_user(hadal_session or authorization.replace("Bearer ", ""))
+    existing = q("SELECT key FROM worker_keys WHERE user_id=? ORDER BY created_at LIMIT 1", (user["id"],))
+    if existing:
+        # keep legacy column in sync so old lookups keep working
+        if not user["api_key"]:
+            q("UPDATE users SET api_key=? WHERE id=?", (existing[0]["key"], user["id"]))
+        response.status_code = 200
+        return {"api_key": existing[0]["key"]}
     if not user["api_key"]:
         key = "hk_" + secrets.token_hex(20)
         q("UPDATE users SET api_key=? WHERE id=?", (key, user["id"]))
+        q("INSERT INTO worker_keys VALUES (?,?,?,?)", (key, "default", user["id"], time.time()))
         user["api_key"] = key
     response.status_code = 200
     return {"api_key": user["api_key"]}
@@ -437,8 +445,11 @@ def my_workers(x_worker_key: str = Header(default=""), hadal_session: str = Cook
     if x_worker_key:
         rows = q(
             """SELECT w.id, w.gpu, w.vram, w.name, w.paused, w.last_seen, w.gpu_hours, w.cpu_limit, w.vram_limit
-               FROM workers w JOIN worker_keys k ON k.user_id = w.owner_id WHERE k.key=?""",
-            (x_worker_key,),
+               FROM workers w
+               LEFT JOIN worker_keys k ON k.user_id = w.owner_id
+               JOIN users u ON u.id = w.owner_id
+               WHERE k.key=? OR u.api_key=?""",
+            (x_worker_key, x_worker_key),
         )
         return rows
     user = _require_user(hadal_session)
@@ -489,7 +500,11 @@ class SettingsIn(BaseModel):
 def update_worker(worker_id: str, body: SettingsIn, x_worker_key: str = Header(default="")):
     if not x_worker_key:
         raise HTTPException(status_code=401, detail="worker key required")
-    rows = q("SELECT w.* FROM workers w JOIN worker_keys k ON k.user_id=w.owner_id WHERE w.id=? AND k.key=?", (worker_id, x_worker_key))
+    rows = q("""SELECT w.* FROM workers w
+                LEFT JOIN worker_keys k ON k.user_id = w.owner_id
+                JOIN users u2 ON u2.id = w.owner_id
+                WHERE w.id=? AND (k.key=? OR u2.api_key=?)""",
+            (worker_id, x_worker_key, x_worker_key))
     if not rows:
         raise HTTPException(status_code=404, detail="worker not found for this key")
     if body.name is not None:
