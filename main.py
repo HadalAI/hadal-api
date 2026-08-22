@@ -281,11 +281,11 @@ def auth_start(provider: str):
     return resp
 
 
-async def _finish_oauth(provider: str, code: str, response: Response) -> str:
+def _finish_oauth(provider: str, code: str, response: Response) -> str:
     import httpx
 
     if provider == "github":
-        tok_r = await httpx.post(
+        tok_r = httpx.post(
             "https://github.com/login/oauth/access_token",
             json={
                 "client_id": GITHUB_CLIENT_ID,
@@ -298,7 +298,7 @@ async def _finish_oauth(provider: str, code: str, response: Response) -> str:
         if not access:
             raise HTTPException(status_code=400, detail="token exchange failed")
         hdrs = {"Authorization": f"Bearer {access}"}
-        u_r = await httpx.get("https://api.github.com/user", headers=hdrs)
+        u_r = httpx.get("https://api.github.com/user", headers=hdrs)
         u = u_r.json()
         user = _upsert_user("github", str(u["id"]), u.get("login") or "", u.get("avatar_url") or "")
     else:
@@ -309,11 +309,11 @@ async def _finish_oauth(provider: str, code: str, response: Response) -> str:
             "code": code,
             "redirect_uri": "https://api.hadal.run/auth/discord/callback",
         }
-        tok_r = await httpx.post("https://discord.com/api/oauth2/token", data=data)
+        tok_r = httpx.post("https://discord.com/api/oauth2/token", data=data)
         access = tok_r.json().get("access_token")
         if not access:
             raise HTTPException(status_code=400, detail="token exchange failed")
-        u_r = await httpx.get(
+        u_r = httpx.get(
             "https://discord.com/api/users/@me",
             headers={"Authorization": f"Bearer {access}"},
         )
@@ -330,14 +330,14 @@ async def _finish_oauth(provider: str, code: str, response: Response) -> str:
 
 
 @app.get("/auth/github/callback")
-async def github_callback(code: str, response: Response):
-    await _finish_oauth("github", code, response)
+def github_callback(code: str, response: Response):
+    _finish_oauth("github", code, response)
     return Response(status_code=302, headers={"Location": SITE_URL})
 
 
 @app.get("/auth/discord/callback")
-async def discord_callback(code: str, response: Response):
-    await _finish_oauth("discord", code, response)
+def discord_callback(code: str, response: Response):
+    _finish_oauth("discord", code, response)
     return Response(status_code=302, headers={"Location": SITE_URL})
 
 
