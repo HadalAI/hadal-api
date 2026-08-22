@@ -60,6 +60,12 @@ TABLES = {
   user_id TEXT NOT NULL REFERENCES users(id),
   created_at REAL NOT NULL
 )""",
+    "worker_keys": """CREATE TABLE IF NOT EXISTS worker_keys(
+  key TEXT PRIMARY KEY,
+  label TEXT NOT NULL DEFAULT '',
+  user_id TEXT NOT NULL REFERENCES users(id),
+  created_at REAL NOT NULL
+)""",
 }
 
 
@@ -355,6 +361,38 @@ def me(hadal_session: str = Cookie(default="")):
     return rows[0]
 
 
+# ---------- WORKER KEYS (multiple, deletable) ----------
+class KeyIn(BaseModel):
+    label: str = ""
+
+
+@app.get("/account/keys")
+def list_keys(hadal_session: str = Cookie(default="")):
+    user = _require_user(hadal_session)
+    keys = q("SELECT key, label, created_at FROM worker_keys WHERE user_id=? ORDER BY created_at", (user["id"],))
+    # include legacy single key if set and not already in table
+    if user["api_key"] and not any(k["key"] == user["api_key"] for k in keys):
+        keys.insert(0, {"key": user["api_key"], "label": "default", "created_at": None})
+    return keys
+
+
+@app.post("/account/keys", status_code=201)
+def create_key(body: KeyIn, hadal_session: str = Cookie(default="")):
+    user = _require_user(hadal_session)
+    key = "hk_" + secrets.token_hex(20)
+    q("INSERT INTO worker_keys VALUES (?,?,?,?)", (key, body.label, user["id"], time.time()))
+    return {"key": key, "label": body.label}
+
+
+@app.delete("/account/keys/{key}")
+def delete_key(key: str, hadal_session: str = Cookie(default="")):
+    user = _require_user(hadal_session)
+    q("DELETE FROM worker_keys WHERE key=? AND user_id=?", (key, user["id"]))
+    if user["api_key"] == key:
+        q("UPDATE users SET api_key=NULL WHERE id=?", (user["id"],))
+    return {"status": "deleted"}
+
+
 @app.post("/logout")
 def logout(response: Response, hadal_session: str = Cookie(default="")):
     if hadal_session:
@@ -393,7 +431,8 @@ def my_workers(x_worker_key: str = Header(default=""), hadal_session: str = Cook
     """List workers owned by this account. Accepts session cookie OR worker key."""
     if x_worker_key:
         rows = q(
-            "SELECT w.id, w.gpu, w.vram, w.name, w.paused, w.last_seen, w.gpu_hours FROM workers w JOIN users u ON u.id=w.owner_id WHERE u.api_key=?",
+            """SELECT w.id, w.gpu, w.vram, w.name, w.paused, w.last_seen, w.gpu_hours
+               FROM workers w JOIN worker_keys k ON k.user_id = w.owner_id WHERE k.key=?""",
             (x_worker_key,),
         )
         return rows
@@ -417,10 +456,10 @@ def claim_worker(body: ClaimIn, x_worker_key: str = Header(default="")):
     """
     if not x_worker_key:
         raise HTTPException(status_code=401, detail="worker key required")
-    owners = q("SELECT id FROM users WHERE api_key=?", (x_worker_key,))
+    owners = q("SELECT user_id FROM worker_keys WHERE key=? UNION SELECT id FROM users WHERE api_key=?", (x_worker_key, x_worker_key))
     if not owners:
         raise HTTPException(status_code=401, detail="invalid worker key")
-    owner_id = owners[0]["id"]
+    owner_id = owners[0]["user_id" if "user_id" in owners[0] else "id"]
     machine = body.machine or secrets.token_hex(4)
     wid = f"{machine[:12]}"
     existing = q("SELECT * FROM workers WHERE id=?", (wid,))
@@ -443,7 +482,7 @@ class SettingsIn(BaseModel):
 def update_worker(worker_id: str, body: SettingsIn, x_worker_key: str = Header(default="")):
     if not x_worker_key:
         raise HTTPException(status_code=401, detail="worker key required")
-    rows = q("SELECT w.* FROM workers w JOIN users u ON u.id=w.owner_id WHERE w.id=? AND u.api_key=?", (worker_id, x_worker_key))
+    rows = q("SELECT w.* FROM workers w JOIN worker_keys k ON k.user_id=w.owner_id WHERE w.id=? AND k.key=?", (worker_id, x_worker_key))
     if not rows:
         raise HTTPException(status_code=404, detail="worker not found for this key")
     if body.name is not None:
