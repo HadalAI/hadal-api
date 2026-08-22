@@ -631,3 +631,130 @@ def start_training(body: TrainIn, hadal_session: str = Cookie(default=""), autho
         (slug, body.name, f"{body.base_model} | {body.notes}".strip(" |"), "ACTIVE", time.time()),
     )
     return {"slug": slug, "status": "ACTIVE"}
+
+
+# ---------- JOB DISTRIBUTION ----------
+class JobCreateIn(BaseModel):
+    run_slug: str
+    base_model: str = ""
+    dataset_url: str = ""
+    shard_total: int = 5
+
+
+def _online_workers() -> list:
+    cutoff = time.time() - 300
+    return q(
+        "SELECT id FROM workers WHERE paused=0 AND last_seen > ? ORDER BY gpu_hours ASC",
+        (cutoff,),
+    )
+
+
+def _create_jobs_for_run(run_slug: str, base_model: str, dataset_url: str, shard_total: int):
+    """Create one job per shard. Workers claim them one at a time via /jobs/next."""
+    existing = q("SELECT COUNT(*) c FROM jobs WHERE run_slug=?", (run_slug,))[0]["c"]
+    if existing:
+        return
+    for i in range(max(1, min(50, shard_total))):
+        q(
+            "INSERT INTO jobs VALUES (?,?,?,?,?,?,?,?,?,NULL)",
+            (secrets.token_hex(5), run_slug, None, i, shard_total,
+             base_model, dataset_url, "PENDING", "", time.time()),
+        )
+
+
+@app.post("/admin/jobs/create")
+def admin_create_jobs(body: JobCreateIn, hadal_session: str = Cookie(default=""), authorization: str = Header(default="")):
+    _require_admin(hadal_session, authorization)
+    run = q("SELECT * FROM runs WHERE slug=?", (body.run_slug,))
+    if not run:
+        raise HTTPException(status_code=404, detail="run not found")
+    q("UPDATE runs SET status='ACTIVE' WHERE slug=?", (body.run_slug,))
+    _create_jobs_for_run(body.run_slug, body.base_model, body.dataset_url, body.shard_total)
+    jobs = q("SELECT id, shard_index, shard_total, status FROM jobs WHERE run_slug=? ORDER BY shard_index", (body.run_slug,))
+    return {"run": body.run_slug, "jobs": jobs}
+
+
+@app.get("/jobs/next")
+def jobs_next(x_worker_key: str = Header(default="")):
+    """Worker asks for work. Returns one PENDING/ASSIGNED-stale job, marks it ASSIGNED.
+
+    Fairness: jobs ordered by shard_index; workers with fewer completed hours pick first
+    is NOT enforced — first-come-first-served, one active job per worker.
+    """
+    if not x_worker_key:
+        raise HTTPException(status_code=401, detail="worker key required")
+    owners = q(
+        "SELECT user_id FROM worker_keys WHERE key=? UNION SELECT id FROM users WHERE api_key=?",
+        (x_worker_key, x_worker_key),
+    )
+    if not owners:
+        raise HTTPException(status_code=401, detail="invalid worker key")
+    owner_id = owners[0].get("user_id") or owners[0].get("id")
+
+    my_workers = q("SELECT id FROM workers WHERE owner_id=?", (owner_id,))
+    my_ids = [w["id"] for w in my_workers]
+    if my_ids:
+        active = q(
+            f"SELECT id FROM jobs WHERE worker_id IN ({','.join('?' * len(my_ids))}) AND status='ASSIGNED'",
+            my_ids,
+        )
+        if active:
+            # already holding a job — return it instead of taking a second
+            return q("SELECT * FROM jobs WHERE id=?", (active[0]["id"],))[0]
+
+    job = q(
+        """SELECT * FROM jobs WHERE status='PENDING' ORDER BY shard_index LIMIT 1"""
+    )
+    if not job:
+        return {"status": "no-jobs"}
+    wid = my_ids[0] if my_ids else owner_id
+    q("UPDATE jobs SET worker_id=?, status='ASSIGNED' WHERE id=?", (wid, job[0]["id"]))
+    return q("SELECT * FROM jobs WHERE id=?", (job[0]["id"],))[0]
+
+
+class JobResultIn(BaseModel):
+    result: str
+
+
+@app.post("/jobs/{job_id}/complete")
+def jobs_complete(job_id: str, body: JobResultIn, x_worker_key: str = Header(default="")):
+    if not x_worker_key:
+        raise HTTPException(status_code=401, detail="worker key required")
+    rows = q("SELECT * FROM jobs WHERE id=?", (job_id,))
+    if not rows:
+        raise HTTPException(status_code=404)
+    job = rows[0]
+    if job["status"] == "DONE":
+        return {"status": "already-done", "gpu_hours_credited": 0}
+
+    # credit GPU hours for the job: 0.5h flat per shard (ponytail: flat rate until real util telemetry)
+    hours = 0.5
+    q("UPDATE jobs SET status='DONE', result=?, finished_at=? WHERE id=?", (body.result[:10000], time.time(), job_id))
+    if job["worker_id"]:
+        q("UPDATE workers SET gpu_hours=gpu_hours+? WHERE id=?", (hours, job["worker_id"]))
+    return {"status": "DONE", "gpu_hours_credited": hours}
+
+
+@app.post("/jobs/{job_id}/fail")
+def jobs_fail(job_id: str, body: KeyIn, x_worker_key: str = Header(default="")):
+    """Release a job back to the queue so another worker can take it."""
+    q("UPDATE jobs SET status='PENDING', worker_id=NULL, result=? WHERE id=?", (f"failed: {body.label[:100]}", job_id))
+    return {"status": "released"}
+
+
+@app.get("/admin/jobs")
+def admin_jobs(run_slug: str = "", hadal_session: str = Cookie(default=""), authorization: str = Header(default="")):
+    _require_admin(hadal_session, authorization)
+    if run_slug:
+        return q("SELECT * FROM jobs WHERE run_slug=? ORDER BY shard_index", (run_slug,))
+    return q("SELECT * FROM jobs ORDER BY created_at DESC LIMIT 100")
+
+
+@app.get("/jobs/progress/{run_slug}")
+def job_progress(run_slug: str):
+    rows = q("SELECT status, COUNT(*) c FROM jobs WHERE run_slug=? GROUP BY status", (run_slug,))
+    by = {r["status"]: r["c"] for r in rows}
+    total = sum(by.values())
+    done = by.get("DONE", 0)
+    return {"total": total, "done": done, "pending": by.get("PENDING", 0),
+            "assigned": by.get("ASSIGNED", 0), "pct": round(done * 100 / total) if total else 0}
