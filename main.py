@@ -4,12 +4,16 @@ import sqlite3
 import time
 
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 DB = os.environ.get("HADAL_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "hadal.db"))
 ADMIN_TOKEN = os.environ.get("HADAL_ADMIN_TOKEN", "")
+CORS_ORIGINS = [o for o in os.environ.get("HADAL_CORS_ORIGINS", "").split(",") if o]
 
 app = FastAPI(title="Hadal Research API")
+if CORS_ORIGINS:
+    app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_methods=["*"], allow_headers=["*"])
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs(
