@@ -337,14 +337,20 @@ def _finish_oauth(provider: str, code: str, response: Response) -> str:
 
 @app.get("/auth/github/callback")
 def github_callback(code: str, response: Response):
-    _finish_oauth("github", code, response)
-    return Response(status_code=302, headers={"Location": SITE_URL})
+    username = _finish_oauth("github", code, response)
+    return Response(
+        status_code=302,
+        headers={"Location": f"{SITE_URL}/dashboard#auth=ok&u={urllib.parse.quote(username)}"},
+    )
 
 
 @app.get("/auth/discord/callback")
 def discord_callback(code: str, response: Response):
-    _finish_oauth("discord", code, response)
-    return Response(status_code=302, headers={"Location": SITE_URL})
+    username = _finish_oauth("discord", code, response)
+    return Response(
+        status_code=302,
+        headers={"Location": f"{SITE_URL}/dashboard#auth=ok&u={urllib.parse.quote(username)}"},
+    )
 
 
 @app.get("/me")
