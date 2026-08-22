@@ -655,8 +655,10 @@ def _create_jobs_for_run(run_slug: str, base_model: str, dataset_url: str, shard
     if existing:
         return
     for i in range(max(1, min(50, shard_total))):
+        # columns: id, run_slug, worker_id, shard_index, shard_total, base_model,
+        #          dataset_url, status, result, created_at, finished_at
         q(
-            "INSERT INTO jobs VALUES (?,?,?,?,?,?,?,?,?,NULL)",
+            "INSERT INTO jobs VALUES (?,?,?,?,?,?,?,?,?,?,NULL)",
             (secrets.token_hex(5), run_slug, None, i, shard_total,
              base_model, dataset_url, "PENDING", "", time.time()),
         )
