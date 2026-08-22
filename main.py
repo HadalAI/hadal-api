@@ -516,3 +516,117 @@ def update_worker(worker_id: str, body: SettingsIn, x_worker_key: str = Header(d
     if body.vram_limit is not None:
         q("UPDATE workers SET vram_limit=? WHERE id=?", (max(1.0, min(100.0, body.vram_limit)), worker_id))
     return q("SELECT id, gpu, vram, name, paused, last_seen, gpu_hours, cpu_limit, vram_limit FROM workers WHERE id=?", (worker_id,))[0]
+
+# ---------- ADMIN ----------
+def _require_admin(hadal_session: str = Cookie(default=""), authorization: str = Header(default="")) -> dict:
+    token = hadal_session or authorization.replace("Bearer ", "")
+    if not token:
+        raise HTTPException(status_code=401, detail="sign in first")
+    rows = q(
+        """SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id
+           WHERE s.token=? AND u.is_admin=1""",
+        (token,),
+    )
+    if not rows:
+        raise HTTPException(status_code=403, detail="admin only")
+    return rows[0]
+
+
+@app.get("/admin/me")
+def admin_me(hadal_session: str = Cookie(default=""), authorization: str = Header(default="")):
+    user = _require_user(hadal_session, authorization)
+    return {"username": user["username"], "is_admin": bool(user["is_admin"])}
+
+
+@app.get("/admin/users")
+def admin_users(hadal_session: str = Cookie(default=""), authorization: str = Header(default="")):
+    _require_admin(hadal_session, authorization)
+    return q("SELECT id, username, is_admin, created_at FROM users ORDER BY created_at DESC")
+
+
+@app.post("/admin/users/{user_id}/admin")
+def set_admin(user_id: str, body: KeyIn, hadal_session: str = Cookie(default=""), authorization: str = Header(default="")):
+    """body.label repurposed as '1'/'0' to promote/demote."""
+    _require_admin(hadal_session, authorization)
+    q("UPDATE users SET is_admin=? WHERE id=?", (int(body.label or 0), user_id))
+    return {"status": "ok"}
+
+
+class DatasetIn(BaseModel):
+    name: str
+    url: str = ""
+    description: str = ""
+
+
+@app.post("/datasets/submit", status_code=201)
+def submit_dataset(body: DatasetIn, hadal_session: str = Cookie(default=""), authorization: str = Header(default="")):
+    user = _require_user(hadal_session or authorization.replace("Bearer ", ""))
+    did = secrets.token_hex(6)
+    q(
+        "INSERT INTO datasets VALUES (?,?,?,?,?,?,?)",
+        (did, body.name, body.url, body.description, user["id"], "PENDING", time.time()),
+    )
+    return {"id": did, "status": "PENDING"}
+
+
+@app.get("/admin/datasets")
+def admin_datasets(status: str = "", hadal_session: str = Cookie(default=""), authorization: str = Header(default="")):
+    _require_admin(hadal_session, authorization)
+    if status:
+        return q("SELECT * FROM datasets WHERE status=? ORDER BY created_at DESC", (status,))
+    return q("SELECT * FROM datasets ORDER BY created_at DESC")
+
+
+@app.post("/admin/datasets/{did}/{action}")
+def review_dataset(did: str, action: str, hadal_session: str = Cookie(default=""), authorization: str = Header(default="")):
+    if action not in ("approve", "reject"):
+        raise HTTPException(status_code=400)
+    _require_admin(hadal_session, authorization)
+    q("UPDATE datasets SET status=? WHERE id=?", (action.upper(), did))
+    return q("SELECT * FROM datasets WHERE id=?", (did,))[0]
+
+
+class HFIn(BaseModel):
+    org: str = ""
+    token: str = ""
+
+
+@app.post("/admin/hf")
+def connect_hf(body: HFIn, hadal_session: str = Cookie(default=""), authorization: str = Header(default="")):
+    _require_admin(hadal_session, authorization)
+    # upsert single-row settings
+    if DATABASE_URL:
+        q("""INSERT INTO hf_settings VALUES (1,?,?,?) ON CONFLICT (id) DO UPDATE
+             SET org=EXCLUDED.org, token=EXCLUDED.token, connected_at=EXCLUDED.connected_at""",
+          (body.org, body.token, time.time()))
+    else:
+        q("INSERT OR REPLACE INTO hf_settings VALUES (1,?,?,?)", (body.org, body.token, time.time()))
+    return {"status": "connected", "org": body.org}
+
+
+@app.get("/admin/hf")
+def get_hf(hadal_session: str = Cookie(default=""), authorization: str = Header(default="")):
+    _require_admin(hadal_session, authorization)
+    rows = q("SELECT org, connected_at FROM hf_settings WHERE id=1")
+    if not rows:
+        return {"connected": False}
+    return {"connected": True, "org": rows[0]["org"], "connected_at": rows[0]["connected_at"]}
+
+
+class TrainIn(BaseModel):
+    name: str
+    base_model: str = ""
+    dataset_id: str = ""
+    notes: str = ""
+
+
+@app.post("/admin/trainings")
+def start_training(body: TrainIn, hadal_session: str = Cookie(default=""), authorization: str = Header(default="")):
+    _require_admin(hadal_session, authorization)
+    tid = secrets.token_hex(4)
+    slug = body.name.lower().replace(" ", "-")[:40] + "-" + tid
+    q(
+        "INSERT INTO runs VALUES (?,?,?,?,?)",
+        (slug, body.name, f"{body.base_model} | {body.notes}".strip(" |"), "ACTIVE", time.time()),
+    )
+    return {"slug": slug, "status": "ACTIVE"}
