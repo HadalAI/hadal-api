@@ -637,9 +637,29 @@ class HFIn(BaseModel):
     token: str = ""
 
 
+def _hf_whoami(token: str):
+    """Validate an HF token against whoami-v2. Returns account info or None."""
+    import json as _json
+    import urllib.request as _req
+    try:
+        r = _req.Request(
+            "https://huggingface.co/api/whoami-v2",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        with _req.urlopen(r, timeout=10) as resp:
+            return _json.load(resp)
+    except Exception:
+        return None
+
+
 @app.post("/admin/hf")
 def connect_hf(body: HFIn, hadal_session: str = Cookie(default=""), authorization: str = Header(default="")):
     _require_admin(hadal_session, authorization)
+    if not body.org or not body.token:
+        raise HTTPException(status_code=400, detail="org and token are both required")
+    info = _hf_whoami(body.token)
+    if info is None:
+        raise HTTPException(status_code=400, detail="Hugging Face rejected that token — check it's a valid write token (hf_...)")
     # upsert single-row settings
     if DATABASE_URL:
         q("""INSERT INTO hf_settings VALUES (1,?,?,?) ON CONFLICT (id) DO UPDATE
@@ -647,7 +667,7 @@ def connect_hf(body: HFIn, hadal_session: str = Cookie(default=""), authorizatio
           (body.org, body.token, time.time()))
     else:
         q("INSERT OR REPLACE INTO hf_settings VALUES (1,?,?,?)", (body.org, body.token, time.time()))
-    return {"status": "connected", "org": body.org}
+    return {"status": "connected", "org": body.org, "who": info.get("name")}
 
 
 @app.get("/admin/hf")
