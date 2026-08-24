@@ -615,6 +615,23 @@ def submit_dataset(body: DatasetIn, hadal_session: str = Cookie(default=""), aut
     return {"id": did, "status": "PENDING"}
 
 
+@app.get("/datasets")
+def public_datasets():
+    """Approved datasets — the community's shared data shelf."""
+    return q(
+        "SELECT id, name, url, description, created_at FROM datasets WHERE status='APPROVED' ORDER BY created_at DESC"
+    )
+
+
+@app.get("/account/datasets")
+def my_datasets(hadal_session: str = Cookie(default=""), authorization: str = Header(default="")):
+    user = _require_user(hadal_session or authorization.replace("Bearer ", ""))
+    return q(
+        "SELECT id, name, url, description, status, created_at FROM datasets WHERE submitted_by=? ORDER BY created_at DESC",
+        (user["id"],),
+    )
+
+
 @app.get("/admin/datasets")
 def admin_datasets(status: str = "", hadal_session: str = Cookie(default=""), authorization: str = Header(default="")):
     _require_admin(hadal_session, authorization)
